@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>地磅单采集</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 1080px; margin: 24px auto; padding: 0 16px; background:#f6f7f9; color:#222; }
+  h1 { font-size: 20px; }
+  .card { background:#fff; border:1px solid #e3e5e8; border-radius:10px; padding:16px; margin-bottom:16px; }
+  input { padding:7px 10px; border:1px solid #c9ccd1; border-radius:7px; font-size:14px; }
+  button, .btn { padding:7px 16px; border:1px solid #2f6fed; background:#2f6fed; color:#fff; border-radius:7px; cursor:pointer; font-size:14px; text-decoration:none; display:inline-block; }
+  button:hover, .btn:hover { background:#2458c4; }
+  .btn.disabled { background:#e7e9ec; border-color:#d6d9de; color:#9aa0a8; cursor:not-allowed; pointer-events:none; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { text-align:left; padding:7px 10px; border-bottom:1px solid #eceef1; }
+  th { color:#666; font-weight:600; background:#fafbfc; }
+  tr.sel { background:#eef4ff; cursor:pointer; }
+  tr:hover td { background:#f7f9fc; }
+  .badge { padding:3px 10px; border-radius:999px; font-size:12px; white-space:nowrap; }
+  .ok   { background:#e3f5e9; color:#1a7f37; }
+  .warn { background:#fff4d6; color:#9a6700; }
+  .bad  { background:#ffebe9; color:#cf222e; }
+  .err  { color:#cf222e; font-size:12px; }
+  .muted{ color:#8a8f98; font-size:12px; }
+  .voided td { color:#b0b5bc; text-decoration:line-through; }
+  #msg { font-size:13px; margin-left:10px; }
+</style>
+</head>
+<body>
+<h1>地磅单采集 → 结算</h1>
+
+<div class="card">
+  <form id="f">
+    <label>门户地址 <input id="portal" size="28" value="http://portal:8000"></label>
+    <label>业务日期 <input id="date" type="date"></label>
+    <button type="submit">开始采集</button>
+    <span id="msg"></span>
+  </form>
+  <div class="muted" style="margin-top:8px">
+    流程：先接通 SSE 订阅 → 再按固定快照分页补采历史（期间推送持续接收）→ 订阅正常且历史取齐后开放有效单 CSV 下载。
+  </div>
+</div>
+
+<div class="card">
+  <table>
+    <thead><tr>
+      <th>任务</th><th>门户</th><th>日期</th><th>状态</th>
+      <th>单据(有效/总)</th><th>推送事件</th><th>已采页</th><th>原因</th><th>操作</th>
+    </tr></thead>
+    <tbody id="jobs"></tbody>
+  </table>
+</div>
+
+<div class="card" id="tcard" style="display:none">
+  <div style="margin-bottom:8px"><b id="ttitle"></b> <span class="muted">（同单仅保留最高修订号）</span></div>
+  <table>
+    <thead><tr><th>单号</th><th>修订号</th><th>车牌</th><th>净重(kg)</th><th>作废</th></tr></thead>
+    <tbody id="tickets"></tbody>
+  </table>
+</div>
+
+<script>
+const STATES = {
+  connecting:   {label:'连接订阅中',       cls:'warn'},
+  backfilling:  {label:'补采历史中',       cls:'warn'},
+  synced:       {label:'已同步 · 可下载',  cls:'ok'},
+  reconnecting: {label:'订阅中断 · 重连中', cls:'bad'},
+  failed:       {label:'历史补采失败',      cls:'bad'},
+};
+let selected = null;
+document.getElementById('date').value = new Date().toISOString().slice(0,10);
+
+document.getElementById('f').onsubmit = async (e) => {
+  e.preventDefault();
+  const msg = document.getElementById('msg');
+  const r = await fetch('/api/jobs', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({portal_url: document.getElementById('portal').value,
+                          biz_date:  document.getElementById('date').value})});
+  const j = await r.json();
+  msg.innerHTML = r.ok ? `<span style="color:#1a7f37">已创建任务 #${j.id}</span>`
+                       : `<span class="err">${j.detail}</span>`;
+  refresh();
+};
+
+async function refresh() {
+  let jobs = [];
+  try { jobs = await (await fetch('/api/jobs')).json(); } catch(e) { return; }
+  const tb = document.getElementById('jobs');
+  tb.innerHTML = jobs.map(j => {
+    const s = STATES[j.state] || {label:j.state, cls:'warn'};
+    const dl = j.state === 'synced'
+      ? `<a class="btn" href="/api/jobs/${j.id}/csv">下载 CSV</a>`
+      : `<span class="btn disabled" title="仅同步完成后可下载">下载 CSV</span>`;
+    return `<tr class="${selected===j.id?'sel':''}" onclick="sel(${j.id})">
+      <td>#${j.id}</td><td>${j.portal_url}</td><td>${j.biz_date}</td>
+      <td><span class="badge ${s.cls}">${s.label}</span></td>
+      <td>${j.ticket_valid} / ${j.ticket_total}</td>
+      <td>${j.events_received}</td><td>${j.pages_fetched}</td>
+      <td class="err">${j.error ?? ''}</td><td>${dl}</td></tr>`;
+  }).join('');
+  if (selected && jobs.some(j => j.id === selected)) {
+    const t = await (await fetch(`/api/jobs/${selected}/tickets`)).json();
+    document.getElementById('tcard').style.display = '';
+    document.getElementById('ttitle').textContent = `任务 #${selected} 磅单明细`;
+    document.getElementById('tickets').innerHTML = t.map(x =>
+      `<tr class="${x.voided ? 'voided' : ''}">
+        <td>${x.ticket_no}</td><td>${x.revision}</td><td>${x.plate}</td>
+        <td>${x.net_weight}</td><td>${x.voided ? '已作废' : ''}</td></tr>`).join('');
+  }
+}
+function sel(id){ selected = id; refresh(); }
+setInterval(refresh, 1000); refresh();
+</script>
+</body>
+</html>

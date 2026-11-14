@@ -1,0 +1,24 @@
+services:
+  portal:
+    build: ./portal
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  collector:
+    build: ./collector
+    ports:
+      - "8001:8001"
+    environment:
+      DATA_DIR: /data
+      HISTORY_TIMEOUT: "5"        # 历史接口单次请求超时（秒）
+      RECONNECT_DELAY: "1"        # 断流后重连间隔（秒）
+      BACKFILL_RETRY_DELAY: "5"   # 历史补采失败重试间隔（秒）
+    volumes:
+      - collector-data:/data
+    depends_on:
+      - portal
+    restart: unless-stopped
+
+volumes:
+  collector-data:
