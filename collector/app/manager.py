@@ -6,6 +6,7 @@
     synced        订阅正常且历史取齐 —— 唯一允许下载 CSV 的状态
     reconnecting  订阅中断，等待自动重连（下载立即关闭）
     failed        历史补采失败，显示原因并保持未同步（自动重试）
+    revoked       已撤销（终态）：订阅与补采停止、磅单清除、下载永久关闭
 
 关键不变式：
 1. 先接通订阅，再补采历史；补采期间推送照常落库。
@@ -13,6 +14,9 @@
    因此迟到旧版无法覆盖、也无法恢复已作废单。
 3. 每次（重）连接 epoch +1；补采完成只有在 epoch 未变且仍处于本连接
    生命期内才把状态推进到 synced —— 旧连接的补采完成不能恢复下载。
+4. revoked 是终态：所有状态迁移与票据 UPSERT 都带 state<>'revoked' 条件，
+   正在返回的历史页、已排队的推送、残留的补采回调在撤销后全部成为
+   空操作；重复撤销与进程重启都不会让任务复活或留下单据。
 """
 import asyncio
 import json
@@ -26,10 +30,13 @@ HISTORY_TIMEOUT = float(os.environ.get("HISTORY_TIMEOUT", "5"))
 RECONNECT_DELAY = float(os.environ.get("RECONNECT_DELAY", "1"))
 BACKFILL_RETRY_DELAY = float(os.environ.get("BACKFILL_RETRY_DELAY", "5"))
 
-# 同单仅保留最高修订：低版本到达时 WHERE 不成立，整行不变
+# 同单仅保留最高修订：低版本到达时 WHERE 不成立，整行不变。
+# 末尾的 EXISTS 防护：任务已撤销时 SELECT 返回 0 行，插入/更新整体成为
+# 空操作 —— 正在返回的历史页与已排队的推送不会在撤销后写回。
 UPSERT_SQL = """
 INSERT INTO tickets (job_id, ticket_no, revision, plate, net_weight, voided)
-VALUES (?, ?, ?, ?, ?, ?)
+SELECT ?, ?, ?, ?, ?, ?
+WHERE EXISTS (SELECT 1 FROM jobs WHERE jobs.id = ? AND jobs.state <> 'revoked')
 ON CONFLICT(job_id, ticket_no) DO UPDATE SET
     revision   = excluded.revision,
     plate      = excluded.plate,
@@ -49,10 +56,14 @@ def ensure_runner(job_id: int, portal_url: str, biz_date: str) -> None:
 
 async def _set_state(job_id: int, epoch: int, state: str,
                      error: str | None = None, guard: tuple = ()) -> None:
-    """按 (job, epoch) 条件更新状态；guard 限定允许从哪些状态迁移。"""
+    """按 (job, epoch) 条件更新状态；guard 限定允许从哪些状态迁移。
+
+    state<>'revoked' 是硬条件：已撤销是终态，任何残留回调（断流收尾、
+    补采完成、失败重试）都无法让任务复活。
+    """
     d = await db.conn()
     sql = ("UPDATE jobs SET state=?, error=?, updated_at=datetime('now') "
-           "WHERE id=? AND epoch=?")
+           "WHERE id=? AND epoch=? AND state<>'revoked'")
     params: list = [state, error, job_id, epoch]
     if guard:
         sql += " AND state IN (%s)" % ",".join("?" * len(guard))
@@ -61,16 +72,48 @@ async def _set_state(job_id: int, epoch: int, state: str,
     await d.commit()
 
 
+async def revoke(job_id: int) -> None:
+    """撤销任务：停止订阅与补采、清除已采磅单、永久关闭下载。
+
+    顺序保证无写回窗口：
+      1) 单条 UPDATE 置 revoked（终态）——此后所有 UPSERT 因 EXISTS
+         防护失效，所有状态迁移因 revoked 硬条件失效；
+      2) 删除该任务全部磅单；
+      3) 取消后台协程并等其收尾（收尾里的状态迁移同样被终态挡住）。
+    幂等：重复撤销时 UPDATE 命中 0 行，结果不变。
+    """
+    d = await db.conn()
+    await d.execute(
+        "UPDATE jobs SET state='revoked', "
+        "error='任务已撤销：订阅与补采已停止，磅单已清除，不进入结算', "
+        "revoked_at=COALESCE(revoked_at, datetime('now')), "
+        "updated_at=datetime('now') "
+        "WHERE id=? AND state<>'revoked'", (job_id,))
+    await d.execute("DELETE FROM tickets WHERE job_id=?", (job_id,))
+    await d.commit()
+    task = _runners.pop(job_id, None)
+    if task is not None:
+        task.cancel()
+        try:
+            await task  # 等收尾跑完，确保不留未完成的回调
+        except asyncio.CancelledError:
+            pass
+
+
 async def _run(job_id: int, portal: str, date: str) -> None:
     while True:
         d = await db.conn()
-        # 新一轮连接：代次 +1，使上一代的补采回调全部失效
+        # 新一轮连接：代次 +1，使上一代的补采回调全部失效。
+        # 已撤销任务到此为止（revoke() 会取消本协程；此处是兜底防线）。
         await d.execute(
             "UPDATE jobs SET epoch=epoch+1, state='connecting', error=NULL, "
-            "pages_fetched=0, updated_at=datetime('now') WHERE id=?", (job_id,))
+            "pages_fetched=0, updated_at=datetime('now') "
+            "WHERE id=? AND state<>'revoked'", (job_id,))
         await d.commit()
         row = await (await d.execute(
-            "SELECT epoch FROM jobs WHERE id=?", (job_id,))).fetchone()
+            "SELECT epoch, state FROM jobs WHERE id=?", (job_id,))).fetchone()
+        if row is None or row["state"] == "revoked":
+            return
         epoch = row["epoch"]
 
         backfill_task: asyncio.Task | None = None
@@ -175,10 +218,10 @@ async def _apply_event(job_id: int, evt: dict) -> None:
     await d.execute(UPSERT_SQL, (
         job_id, str(evt["ticket_no"]), int(evt["revision"]),
         str(evt["plate"]), float(evt["net_weight"]),
-        1 if evt.get("voided") else 0))
+        1 if evt.get("voided") else 0, job_id))
     await d.execute(
         "UPDATE jobs SET events_received=events_received+1, "
-        "updated_at=datetime('now') WHERE id=?", (job_id,))
+        "updated_at=datetime('now') WHERE id=? AND state<>'revoked'", (job_id,))
     await d.commit()
 
 
@@ -186,10 +229,10 @@ async def _apply_page(job_id: int, items: list[dict]) -> None:
     d = await db.conn()
     await d.executemany(UPSERT_SQL, [
         (job_id, str(it["ticket_no"]), int(it["revision"]), str(it["plate"]),
-         float(it["net_weight"]), 1 if it.get("voided") else 0)
+         float(it["net_weight"]), 1 if it.get("voided") else 0, job_id)
         for it in items
     ])
     await d.execute(
         "UPDATE jobs SET pages_fetched=pages_fetched+1, "
-        "updated_at=datetime('now') WHERE id=?", (job_id,))
+        "updated_at=datetime('now') WHERE id=? AND state<>'revoked'", (job_id,))
     await d.commit()

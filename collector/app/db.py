@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     epoch           INTEGER NOT NULL DEFAULT 0,
     events_received INTEGER NOT NULL DEFAULT 0,
     pages_fetched   INTEGER NOT NULL DEFAULT 0,
+    revoked_at      TEXT,  -- 撤销时间；非 NULL 即终态，任务永不复活
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -40,5 +41,14 @@ async def conn() -> aiosqlite.Connection:
         _conn = await aiosqlite.connect(DB_PATH)
         _conn.row_factory = aiosqlite.Row
         await _conn.executescript(SCHEMA)
+        await _migrate(_conn)
         await _conn.commit()
     return _conn
+
+
+async def _migrate(d: aiosqlite.Connection) -> None:
+    """老库就地升级：jobs 缺 revoked_at 列时补上。"""
+    rows = await (await d.execute("PRAGMA table_info(jobs)")).fetchall()
+    cols = {r["name"] for r in rows}
+    if "revoked_at" not in cols:
+        await d.execute("ALTER TABLE jobs ADD COLUMN revoked_at TEXT")

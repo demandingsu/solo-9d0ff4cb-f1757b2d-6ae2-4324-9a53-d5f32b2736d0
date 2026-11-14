@@ -30,6 +30,9 @@ _seq: dict[str, int] = {}
 _subscribers: dict[str, set[asyncio.Queue]] = {}
 _snapshots: dict[str, dict] = {}
 _config = {"history_delay_ms": 0, "snapshot_ttl_s": 120}
+# date -> 自动补称后台协程（实时补称流）
+_auto_reweigh: dict[str, asyncio.Task] = {}
+_auto_reweigh_interval: dict[str, int] = {}
 
 
 def ensure_date(date: str) -> None:
@@ -214,10 +217,49 @@ async def disconnect():
     return {"disconnected": n}
 
 
+# ------------------------------------------------------------ 实时补称流
+
+async def _auto_reweigh_loop(date: str, interval_ms: int) -> None:
+    """每隔 interval_ms 对当天一张未作废单自动补称并推送（实时补称流）。"""
+    try:
+        while True:
+            await asyncio.sleep(interval_ms / 1000)
+            ensure_date(date)
+            candidates = [n for n, t in _tickets[date].items() if not t["voided"]]
+            if not candidates:
+                continue
+            no = random.choice(candidates)
+            new = _bump(date, no, net_weight=random.randint(10000, 50000))
+            _broadcast(date, new)
+    except asyncio.CancelledError:
+        pass
+
+
+@app.post("/api/control/auto_reweigh")
+async def auto_reweigh(date: str, interval_ms: int = 2000, on: bool = True):
+    """开启/关闭某天的实时补称流（模拟码头持续补称）。"""
+    ensure_date(date)
+    interval_ms = max(200, interval_ms)
+    task = _auto_reweigh.get(date)
+    if on:
+        if task is None or task.done():
+            _auto_reweigh[date] = asyncio.create_task(
+                _auto_reweigh_loop(date, interval_ms))
+        _auto_reweigh_interval[date] = interval_ms
+        return {"date": date, "auto_reweigh": "on", "interval_ms": interval_ms}
+    if task is not None:
+        task.cancel()
+        _auto_reweigh.pop(date, None)
+    _auto_reweigh_interval.pop(date, None)
+    return {"date": date, "auto_reweigh": "off"}
+
+
 @app.get("/api/control/config")
 async def get_config():
     return {**_config,
             "subscribers": sum(len(s) for s in _subscribers.values()),
+            "auto_reweigh": {d: _auto_reweigh_interval.get(d)
+                             for d, t in _auto_reweigh.items() if not t.done()},
             "dates": {d: len(t) for d, t in _tickets.items()}}
 
 
@@ -273,15 +315,26 @@ CONTROL_PAGE = """<!DOCTYPE html>
   </div>
 </div>
 <div class="card">
-  <h2>故障注入</h2>
+  <h2>实时补称流（自动补称，模拟码头持续作业）</h2>
+  <div class="row">
+    <label>间隔 ms <input id="rw_ms" type="number" value="2000" style="width:90px"></label>
+    <button onclick="autoRw(true)">开启实时补称流</button>
+    <button class="danger" onclick="autoRw(false)">停止</button>
+    <span class="muted">开启后按间隔对上方日期随机补称并推送，用于观察撤销后推送不再写回</span>
+  </div>
+</div>
+<div class="card">
+  <h2>故障注入 / 延迟历史</h2>
   <div class="row">
     <label>历史延迟 ms <input id="delay" type="number" value="0" style="width:90px"></label>
     <label>快照有效期 s <input id="ttl" type="number" value="120" style="width:70px"></label>
     <button onclick="setCfg()">应用</button>
     <button onclick="quickCfg(0,120)">恢复正常</button>
+    <button onclick="quickCfg(1500,120)">慢速分页(1.5s/页)</button>
     <button onclick="quickCfg(8000,120)">历史超时(8s)</button>
     <button onclick="quickCfg(1500,2)">快照过期(1.5s×TTL2s)</button>
   </div>
+  <div class="muted" style="margin-top:6px">「慢速分页」拉长补采窗口，便于在补采中途到采集端点「撤销」，核对正在返回的历史页不会写回。</div>
 </div>
 <div class="card">
   <h2>状态</h2>
@@ -297,6 +350,11 @@ async function act(name){
   let url = `/api/control/${name}?date=${d}`;
   if(no) url += `&ticket_no=${encodeURIComponent(no)}`;
   const j = await post(url); flash(j);
+}
+async function autoRw(on){
+  const d = document.getElementById('date').value;
+  const ms = document.getElementById('rw_ms').value;
+  flash(await post(`/api/control/auto_reweigh?date=${d}&interval_ms=${ms}&on=${on}`));
 }
 async function setCfg(){
   const delay = document.getElementById('delay').value;

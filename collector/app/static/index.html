@@ -20,9 +20,13 @@
   .ok   { background:#e3f5e9; color:#1a7f37; }
   .warn { background:#fff4d6; color:#9a6700; }
   .bad  { background:#ffebe9; color:#cf222e; }
+  .off  { background:#eceff3; color:#5f6570; }
   .err  { color:#cf222e; font-size:12px; }
   .muted{ color:#8a8f98; font-size:12px; }
   .voided td { color:#b0b5bc; text-decoration:line-through; }
+  tr.revoked td { color:#9aa0a8; background:#fafbfc; }
+  .revoke-btn { padding:4px 10px; border:1px solid #d9707a; background:#fff; color:#b02a37; border-radius:7px; cursor:pointer; font-size:12px; }
+  .revoke-btn:hover { background:#ffebe9; }
   #msg { font-size:13px; margin-left:10px; }
 </style>
 </head>
@@ -38,6 +42,7 @@
   </form>
   <div class="muted" style="margin-top:8px">
     流程：先接通 SSE 订阅 → 再按固定快照分页补采历史（期间推送持续接收）→ 订阅正常且历史取齐后开放有效单 CSV 下载。
+    日期填错可点「撤销」：立即停止订阅与补采、清除已采磅单、永久关闭下载（终态，不可恢复），再按正确日期新建任务即可。
   </div>
 </div>
 
@@ -66,6 +71,7 @@ const STATES = {
   synced:       {label:'已同步 · 可下载',  cls:'ok'},
   reconnecting: {label:'订阅中断 · 重连中', cls:'bad'},
   failed:       {label:'历史补采失败',      cls:'bad'},
+  revoked:      {label:'已撤销 · 不结算',   cls:'off'},
 };
 let selected = null;
 document.getElementById('date').value = new Date().toISOString().slice(0,10);
@@ -89,15 +95,19 @@ async function refresh() {
   const tb = document.getElementById('jobs');
   tb.innerHTML = jobs.map(j => {
     const s = STATES[j.state] || {label:j.state, cls:'warn'};
+    const revoked = j.state === 'revoked';
     const dl = j.state === 'synced'
       ? `<a class="btn" href="/api/jobs/${j.id}/csv">下载 CSV</a>`
-      : `<span class="btn disabled" title="仅同步完成后可下载">下载 CSV</span>`;
-    return `<tr class="${selected===j.id?'sel':''}" onclick="sel(${j.id})">
+      : `<span class="btn disabled" title="${revoked ? '任务已撤销，不再提供下载' : '仅同步完成后可下载'}">下载 CSV</span>`;
+    const act = revoked
+      ? `<span class="muted">撤销于 ${j.revoked_at ?? '-'}</span>`
+      : `<button class="revoke-btn" onclick="event.stopPropagation();revoke(${j.id})">撤销</button>`;
+    return `<tr class="${selected===j.id?'sel':''} ${revoked?'revoked':''}" onclick="sel(${j.id})">
       <td>#${j.id}</td><td>${j.portal_url}</td><td>${j.biz_date}</td>
       <td><span class="badge ${s.cls}">${s.label}</span></td>
       <td>${j.ticket_valid} / ${j.ticket_total}</td>
       <td>${j.events_received}</td><td>${j.pages_fetched}</td>
-      <td class="err">${j.error ?? ''}</td><td>${dl}</td></tr>`;
+      <td class="err">${j.error ?? ''}</td><td>${dl} ${act}</td></tr>`;
   }).join('');
   if (selected && jobs.some(j => j.id === selected)) {
     const t = await (await fetch(`/api/jobs/${selected}/tickets`)).json();
@@ -108,6 +118,13 @@ async function refresh() {
         <td>${x.ticket_no}</td><td>${x.revision}</td><td>${x.plate}</td>
         <td>${x.net_weight}</td><td>${x.voided ? '已作废' : ''}</td></tr>`).join('');
   }
+}
+async function revoke(id) {
+  if (!confirm(`撤销任务 #${id}？\n\n将立即停止订阅与补采、清除已采磅单并关闭 CSV 下载，错日数据不会进入结算。\n此操作不可恢复（可随后按正确日期新建任务）。`)) return;
+  const r = await fetch(`/api/jobs/${id}/revoke`, {method: 'POST'});
+  const j = await r.json();
+  if (!r.ok) alert(j.detail || '撤销失败');
+  refresh();
 }
 function sel(id){ selected = id; refresh(); }
 setInterval(refresh, 1000); refresh();

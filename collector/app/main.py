@@ -23,10 +23,12 @@ class JobIn(BaseModel):
 
 @app.on_event("startup")
 async def startup() -> None:
-    # 重启后恢复所有未完成的采集任务（数据已持久化，状态机重新走连接流程）
+    # 重启后恢复所有未完成的采集任务（数据已持久化，状态机重新走连接流程）。
+    # 已撤销（revoked）是终态：不恢复、不复活，磅单已在撤销时清除。
     d = await db.conn()
     rows = await (await d.execute(
-        "SELECT id, portal_url, biz_date FROM jobs")).fetchall()
+        "SELECT id, portal_url, biz_date FROM jobs "
+        "WHERE state <> 'revoked'")).fetchall()
     for r in rows:
         manager.ensure_runner(r["id"], r["portal_url"], r["biz_date"])
 
@@ -75,9 +77,23 @@ async def job_tickets(job_id: int):
     return [dict(r) for r in rows]
 
 
+@app.post("/api/jobs/{job_id}/revoke")
+async def revoke_job(job_id: int):
+    """撤销任务：停止订阅与补采、清除已采磅单、永久关闭 CSV 下载。
+
+    幂等：重复撤销返回相同的已撤销状态，不会复活任务或留下单据。
+    """
+    await _job_or_404(job_id)
+    await manager.revoke(job_id)
+    return await _job_or_404(job_id)
+
+
 @app.get("/api/jobs/{job_id}/csv")
 async def job_csv(job_id: int):
     job = await _job_or_404(job_id)
+    if job["state"] == "revoked":
+        raise HTTPException(
+            410, "任务已撤销，磅单已清除，不再提供下载")
     if job["state"] != "synced":
         raise HTTPException(
             409, f"未同步完成，禁止下载（当前状态：{job['state']}）")
